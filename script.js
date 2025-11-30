@@ -30,18 +30,17 @@ async function download_chat() {
   const uuid = match[2];
 
   status.innerText = "Fetching stream metadata ...";
-  const stream_res = await fetch(`https://kick.com/api/v1/video/${uuid}`);
+  const stream_res = await fetch(`https://kick.com/api/v1/video/${uuid}`, { keepalive: true, cache: "force-cache" });
   if (!stream_res.ok) {
     console.error(await stream_res.text);
     throw new Error(`Unable to fetch stream metadata: ${stream_res.status} ${stream_res.statusText}`);
   }
   const { livestream } = await stream_res.json();
 
-  status.innerText = "Constructing promises list ...";
+  status.innerText = "Constructing tasks list ...";
 
-  const promises = [];
+  const tasks = [];
   const messages_list = [];
-  let completed_count = 0;
   let error_count = 0;
 
   const duration = livestream.duration / 1000;
@@ -50,23 +49,29 @@ async function download_chat() {
     start_time.setSeconds(start_time.getSeconds() + s);
     const url =
       `https://kick.com/api/v2/channels/${livestream.channel_id}/messages?start_time=${start_time.toISOString()}`;
-    const promise = fetch(url).then((res) => res.json()).then((res) => {
-      completed_count += 1;
-      status.innerText = `Downloading messages ${completed_count}/${promises.length}`;
-
-      if (!res.data || !res.data.messages) {
+    const task = async () => {
+      const res = await fetch(url, { keepalive: true, cache: "force-cache" });
+      if (!res.ok) {
         error_count += 1;
-        return console.error("Unknown res:", res);
+        console.error("res not ok:", res);
+        return;
+      }
+      const json = await res.json();
+
+      if (!json.data || !json.data.messages) {
+        error_count += 1;
+        console.error("Unknown res:", json);
+        return;
       }
 
       const start_time = new Date(livestream.start_time);
-      for (const msg of res.data.messages) {
+      for (const msg of json.data.messages) {
         if (
           !msg.created_at || !msg.sender || !msg.sender.username || !msg.sender.identity ||
           !msg.sender.identity.color || !msg.content
         ) {
-          console.error("Unknown message in res:", res);
           error_count += 1;
+          console.error("Unknown message in res:", json);
           continue;
         }
         const time = Math.floor((new Date(msg.created_at).getTime() - start_time) / 1000);
@@ -80,12 +85,13 @@ async function download_chat() {
         }
         messages_list.push({ time, user_name, user_color, message });
       }
-    });
-    promises.push(promise);
+    };
+    tasks.push(task);
   }
   status.innerText = `Starting download ...`;
 
-  await Promise.all(promises);
+  let done = 0;
+  await spin_tasks(tasks, 100, () => status.innerText = `Downloading messages ${++done}/${tasks.length}`);
 
   status.innerText = `Building csv...`;
 
@@ -109,4 +115,17 @@ async function download_chat() {
 
   if (error_count == 0) status.innerText = "Done!";
   else status.innerText = "Done! but there were some errors (check console)";
+}
+
+async function spin_tasks(list, concurrent, report) {
+  const active = [];
+  for (const task of list) {
+    if (active.length >= concurrent) await Promise.race(active);
+    const promise = task().finally(() => {
+      report();
+      active.splice(active.indexOf(promise), 1);
+    });
+    active.push(promise);
+  }
+  await Promise.all(active);
 }
